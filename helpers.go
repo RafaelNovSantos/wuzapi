@@ -1098,3 +1098,14 @@ func writeChunk(buf *bytes.Buffer, tag string, data []byte) {
 		buf.WriteByte(0)
 	}
 }
+
+// applyPreviewImage swaps the preview thumbnail for a caller-supplied
+// image, reusing the same decode/resize/upload path as the Open Graph one.
+func applyPreviewImage(ctx context.Context, pageURLStr, imageURLStr string, result *openGraphResult) {
+	pageURL, err := url.Parse(pageURLStr)
+	if err != nil {
+		log.Warn().Err(err).Str("url", pageURLStr).Msg("Failed to parse page URL for preview image override")
+		return
+	}
+	fetchOpenGraphImage(ctx, pageURL, imageURLStr, result)
+}

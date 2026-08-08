@@ -2735,6 +2735,9 @@ func (s *server) SendMessage() http.HandlerFunc {
 		Phone         string
 		Body          string
 		LinkPreview   bool
+		Title         *string        `json:"Title,omitempty"`
+		Description   *string        `json:"Description,omitempty"`
+		PreviewImage  *string        `json:"PreviewImage,omitempty"`
 		Id            string
 		ContextInfo   waE2E.ContextInfo
 		QuotedText    string         `json:"QuotedText,omitempty"`
@@ -2784,12 +2787,23 @@ func (s *server) SendMessage() http.HandlerFunc {
 				og = getOpenGraphData(r.Context(), url, txtid)
 			}
 		}
+		if t.PreviewImage != nil && *t.PreviewImage != "" {
+			applyPreviewImage(r.Context(), url, *t.PreviewImage, &og)
+		}
+		previewTitle := og.Title
+		previewDescription := og.Description
+		if t.Title != nil {
+			previewTitle = *t.Title
+		}
+		if t.Description != nil {
+			previewDescription = *t.Description
+		}
 		msg := &waE2E.Message{
 			ExtendedTextMessage: &waE2E.ExtendedTextMessage{
 				Text:          proto.String(t.Body),
 				MatchedText:   proto.String(url),
-				Title:         proto.String(og.Title),
-				Description:   proto.String(og.Description),
+				Title:         proto.String(previewTitle),
+				Description:   proto.String(previewDescription),
 				JPEGThumbnail: og.ImageData,
 			},
 		}
