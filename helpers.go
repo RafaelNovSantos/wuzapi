@@ -40,6 +40,7 @@ import (
 	"github.com/nfnt/resize"
 	"github.com/rs/zerolog/log"
 	"github.com/vincent-petithory/dataurl"
+	"go.mau.fi/whatsmeow"
 )
 
 const (
@@ -1099,13 +1100,128 @@ func writeChunk(buf *bytes.Buffer, tag string, data []byte) {
 	}
 }
 
+type previewImageCacheItem struct {
+	ImageData   []byte
+	HQImageData []byte
+	HQWidth     uint32
+	HQHeight    uint32
+}
+
+type uploadedThumbnailCacheItem struct {
+	Response whatsmeow.UploadResponse
+	Width    uint32
+	Height   uint32
+}
+
+var (
+	previewImageCache      = cache.New(5*time.Minute, 10*time.Minute)
+	previewImageGroup      singleflight.Group
+	uploadedThumbnailCache = cache.New(5*time.Minute, 10*time.Minute)
+	thumbnailUploadGroup   singleflight.Group
+)
+
 // applyPreviewImage swaps the preview thumbnail for a caller-supplied
 // image, reusing the same decode/resize/upload path as the Open Graph one.
+// Results are cached in memory (5 min) to avoid duplicate downloads and resizes.
 func applyPreviewImage(ctx context.Context, pageURLStr, imageURLStr string, result *openGraphResult) {
+	if imageURLStr == "" {
+		return
+	}
+
+	if cachedData, found := previewImageCache.Get(imageURLStr); found {
+		if item, ok := cachedData.(previewImageCacheItem); ok {
+			result.ImageData = item.ImageData
+			result.HQImageData = item.HQImageData
+			result.HQWidth = item.HQWidth
+			result.HQHeight = item.HQHeight
+			return
+		}
+	}
+
 	pageURL, err := url.Parse(pageURLStr)
 	if err != nil {
 		log.Warn().Err(err).Str("url", pageURLStr).Msg("Failed to parse page URL for preview image override")
 		return
 	}
-	fetchOpenGraphImage(ctx, pageURL, imageURLStr, result)
+
+	v, err, _ := previewImageGroup.Do(imageURLStr, func() (any, error) {
+		var res openGraphResult
+		fetchOpenGraphImage(ctx, pageURL, imageURLStr, &res)
+		if len(res.HQImageData) > 0 || len(res.ImageData) > 0 {
+			item := previewImageCacheItem{
+				ImageData:   res.ImageData,
+				HQImageData: res.HQImageData,
+				HQWidth:     res.HQWidth,
+				HQHeight:    res.HQHeight,
+			}
+			previewImageCache.Set(imageURLStr, item, cache.DefaultExpiration)
+			return item, nil
+		}
+		return nil, fmt.Errorf("failed to fetch or decode preview image")
+	})
+
+	if err == nil && v != nil {
+		if item, ok := v.(previewImageCacheItem); ok {
+			result.ImageData = item.ImageData
+			result.HQImageData = item.HQImageData
+			result.HQWidth = item.HQWidth
+			result.HQHeight = item.HQHeight
+			return
+		}
+	}
+
+	if len(result.HQImageData) == 0 && len(result.ImageData) == 0 {
+		fetchOpenGraphImage(ctx, pageURL, imageURLStr, result)
+	}
 }
+
+// uploadThumbnailWithCache uploads the high-res thumbnail to WhatsApp media servers
+// with caching and retry to guarantee high performance and avoid redundant network uploads.
+func uploadThumbnailWithCache(ctx context.Context, client *whatsmeow.Client, txtid string, hqData []byte, width, height uint32) (whatsmeow.UploadResponse, error) {
+	if client == nil {
+		return whatsmeow.UploadResponse{}, fmt.Errorf("whatsmeow client is nil")
+	}
+	if len(hqData) == 0 {
+		return whatsmeow.UploadResponse{}, fmt.Errorf("empty thumbnail data")
+	}
+
+	h := sha256.Sum256(hqData)
+	hash := hex.EncodeToString(h[:])
+	cacheKey := fmt.Sprintf("%s:%s", txtid, hash)
+
+	if cached, found := uploadedThumbnailCache.Get(cacheKey); found {
+		if item, ok := cached.(uploadedThumbnailCacheItem); ok {
+			return item.Response, nil
+		}
+	}
+
+	v, err, _ := thumbnailUploadGroup.Do(cacheKey, func() (any, error) {
+		var lastErr error
+		const maxAttempts = 2
+
+		for attempt := 1; attempt <= maxAttempts; attempt++ {
+			uploaded, upErr := client.Upload(ctx, hqData, whatsmeow.MediaLinkThumbnail)
+			if upErr == nil && uploaded.DirectPath != "" {
+				item := uploadedThumbnailCacheItem{
+					Response: uploaded,
+					Width:    width,
+					Height:   height,
+				}
+				uploadedThumbnailCache.Set(cacheKey, item, cache.DefaultExpiration)
+				return uploaded, nil
+			}
+			lastErr = upErr
+			if attempt < maxAttempts {
+				log.Warn().Err(upErr).Int("attempt", attempt).Msg("Thumbnail upload attempt failed, retrying in 500ms...")
+				time.Sleep(500 * time.Millisecond)
+			}
+		}
+		return whatsmeow.UploadResponse{}, lastErr
+	})
+
+	if err != nil {
+		return whatsmeow.UploadResponse{}, err
+	}
+	return v.(whatsmeow.UploadResponse), nil
+}
+

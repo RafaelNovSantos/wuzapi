@@ -2809,8 +2809,10 @@ func (s *server) SendMessage() http.HandlerFunc {
 		}
 		// Upload the high-res thumbnail so clients render the large preview
 		// card; without these fields only the small inline thumbnail shows.
+		// Uses in-memory caching and automatic retry for resilience and speed.
 		if len(og.HQImageData) > 0 {
-			uploaded, upErr := clientManager.GetWhatsmeowClient(txtid).Upload(r.Context(), og.HQImageData, whatsmeow.MediaLinkThumbnail)
+			cli := clientManager.GetWhatsmeowClient(txtid)
+			uploaded, upErr := uploadThumbnailWithCache(r.Context(), cli, txtid, og.HQImageData, og.HQWidth, og.HQHeight)
 			if upErr != nil {
 				log.Warn().Err(upErr).Str("url", url).Msg("Failed to upload link preview thumbnail, sending inline thumbnail only")
 			} else {
